@@ -9,6 +9,8 @@ Manual retries can work around this, but the probability of skipping reasoning i
 
 This proxy automatically retries when no reasoning content is detected, ensuring that every response returned to the client is accompanied by reasoning.
 
+*This is a brute-force workaround. If there’s actually a setting that solves this, I’d appreciate it if someone could let me know...*
+
 ## How It Works
 
 1. Forwards requests from the client to the upstream LLM server.
