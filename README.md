@@ -77,6 +77,14 @@ response = client.chat.completions.create(
 llama-swap config example
 
 ```yaml
+groups:
+  "forever":
+    persistent: true
+    swap: false
+    exclusive: false
+    members:
+      - "gemma4_proxy"
+
 models:
   gemma4_proxy:
     cmd: |
