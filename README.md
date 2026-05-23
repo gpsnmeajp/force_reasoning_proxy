@@ -73,3 +73,15 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello!"}],
 )
 ```
+
+llama-swap config example
+
+```yaml
+models:
+  gemma4_proxy:
+    cmd: |
+      /home/{user}/force_reasoning_proxy/venv/bin/python3 /home/{user}/force_reasoning_proxy/proxy.py
+      --port ${PORT}
+      --upstream http://localhost:11400/
+      --model gemma4-26B-A4B
+```
