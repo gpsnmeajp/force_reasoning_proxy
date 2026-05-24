@@ -615,17 +615,17 @@ async def _iter_with_timeouts(
 
     以下の 3 種類のタイムアウトを監視します。
 
-    1. チャンク途絶タイムアウト: 意味のあるチャンクが chunk_timeout 秒以上届かない場合。
-       「意味のある」とは reasoning_content または content に非空文字列を含む場合です。
-       チャンクが全く届かない場合も同様にタイムアウトします。
+     1. チャンク途絶タイムアウト: 最初の意味のあるチャンクを受信した後に、
+         意味のあるチャンクが chunk_timeout 秒以上届かない場合。
+         「意味のある」とは reasoning_content または content に非空文字列を含む場合です。
     2. Reasoning タイムアウト: Reasoning フェーズが reasoning_timeout 秒を超えた場合。
     3. 生成タイムアウト: コンテンツ生成フェーズが generation_timeout 秒を超えた場合。
 
     タイムアウト時は対応する例外を送出します。
     timeout 値が 0 以下の場合は、そのタイムアウトは無効になります。
     """
-    # 意味のあるチャンクが最後に届いた時刻（初期値は生成開始時刻）
-    last_meaningful_at = time.monotonic()
+    # 最初の意味のあるチャンクを受信するまではチャンク途絶タイマーを開始しません。
+    last_meaningful_at: float | None = None
     reasoning_started_at: float | None = None
     generation_started_at: float | None = None
     try:
@@ -633,7 +633,7 @@ async def _iter_with_timeouts(
             now = time.monotonic()
 
             # チャンク途絶タイムアウト: 次のチャンクを受信する（タイムアウト付き）
-            if chunk_timeout > 0:
+            if chunk_timeout > 0 and last_meaningful_at is not None:
                 try:
                     item = await asyncio.wait_for(
                         _anext_or_none(gen), timeout=chunk_timeout
@@ -670,7 +670,11 @@ async def _iter_with_timeouts(
                     last_meaningful_at = now
                 else:
                     # 意味のないチャンクが届き続けている場合もチェック
-                    if chunk_timeout > 0 and (now - last_meaningful_at) > chunk_timeout:
+                    if (
+                        chunk_timeout > 0
+                        and last_meaningful_at is not None
+                        and (now - last_meaningful_at) > chunk_timeout
+                    ):
                         logger.warning(
                             "[%s] chunk timeout: only empty chunks for %.1fs",
                             request_id,
