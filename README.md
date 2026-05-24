@@ -9,7 +9,26 @@ Manual retries can work around this, but the probability of skipping reasoning i
 
 This proxy automatically retries when no reasoning content is detected, ensuring that every response returned to the client is accompanied by reasoning.
 
-*This is a brute-force workaround. If there’s actually a setting that solves this, I’d appreciate it if someone could let me know...*
+~~This is a brute-force workaround. If there’s actually a setting that solves this, I’d appreciate it if someone could let me know...~~
+**Update:**
+
+By modifying the Jinja template to always start generation with `<|channel>thought\n* `, the improvement was dramatic — retries became almost unnecessary.  
+Gemma 4 generally starts bullet points with `*`, so this format was chosen, but you can also insert other instructions at the beginning of the thought, which opens up interesting possibilities.
+
+This means stable Reasoning is now achievable without the proxy, but since the proxy has other processing features added, it can still be used as a safety net and for convenient response transformations.
+
+```gemma4_force_think_chat_template.jinja
+{%- if add_generation_prompt -%}
+    {%- if ns.prev_message_type != 'tool_response' and ns.prev_message_type != 'tool_call' -%}
+        {{- '<|turn>model\n' -}}
+        {%- if not enable_thinking | default(false) -%}
+            {{- '<|channel>thought\n<channel|>' -}}
+        {%- else -%}
+            {{- '<|channel>thought\n* ' -}}
+        {%- endif -%}
+    {%- endif -%}
+{%- endif -%}
+```
 
 ## How It Works
 

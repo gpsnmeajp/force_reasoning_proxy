@@ -9,7 +9,28 @@ Gemma4で主に発生する、ローカル LLM の推論（reasoning）スキッ
 
 このプロキシは、推論コンテンツが確認できない場合に自動でリトライを行い、常に推論を伴う応答をクライアントに返します。
 
-※力技です。それ実は設定で解決するよ、っていうのがありましたら誰か教えてください...
+~~※力技です。それ実は設定で解決するよ、っていうのがありましたら誰か教えてください...~~
+
+**追記: **
+
+jinja templateを加工し、常に `<|channel>thought\n* ` から始めるようにしたところ、リトライがほぼ不要になるほど劇的に改善しました。  
+一般にGemma 4は「*」から箇条書きを開始するのでこの形にしていますが、他にも思考の先頭に指示を挿入できるので、色々面白いです。  
+
+これによりproxyがなくても安定してReasoningができるようになりましたが、proxyには他にも加工機能を追加していますので、保険 & 便利加工処理として使えます。
+
+```gemma4_force_think_chat_template.jinja
+{%- if add_generation_prompt -%}
+    {%- if ns.prev_message_type != 'tool_response' and ns.prev_message_type != 'tool_call' -%}
+        {{- '<|turn>model\n' -}}
+        {%- if not enable_thinking | default(false) -%}
+            {{- '<|channel>thought\n<channel|>' -}}
+        {%- else -%}
+            {{- '<|channel>thought\n* ' -}}
+        {%- endif -%}
+    {%- endif -%}
+{%- endif -%}
+```
+
 
 ## 動作概要
 
