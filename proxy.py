@@ -46,6 +46,18 @@ FORCE_MODEL: str | None = None
 # 0 はすべて削除、負の値は無制限に保持します。
 KEEP_REASONING_N: int = 5
 
+# チャンク途絶タイムアウト（秒）。推論中・生成中に意味のあるチャンクが届かない時間が
+# この値を超えた場合、生成をキャンセルしてリトライします。0 以下で無効。
+CHUNK_TIMEOUT: float = 10.0
+
+# Reasoning タイムアウト（秒）。Reasoning フェーズがこの時間を超えた場合、
+# 生成をキャンセルしてリトライします。0 以下で無効。
+REASONING_TIMEOUT: float = 600.0
+
+# 生成タイムアウト（秒）。コンテンツ生成フェーズがこの時間を超えた場合、
+# 生成をキャンセルしてリトライします。0 以下で無効。
+GENERATION_TIMEOUT: float = 600.0
+
 
 # ── アプリケーションライフサイクル ───────────────────────────────────────────
 
@@ -55,13 +67,16 @@ async def lifespan(app: FastAPI):
     # アプリケーション全体で再利用する非同期 HTTP クライアントを初期化します。
     app.state.http_client = httpx.AsyncClient()
     logger.info(
-        "proxy startup upstream=%s buffer_chunks=%s max_retries=%s think_threshold=%s force_model=%s keep_reasoning_n=%s",
+        "proxy startup upstream=%s buffer_chunks=%s max_retries=%s think_threshold=%s force_model=%s keep_reasoning_n=%s chunk_timeout=%s reasoning_timeout=%s generation_timeout=%s",
         UPSTREAM_BASE_URL,
         BUFFER_CHUNKS,
         MAX_RETRIES,
         THINK_THRESHOLD,
         FORCE_MODEL or "-",
         KEEP_REASONING_N,
+        CHUNK_TIMEOUT,
+        REASONING_TIMEOUT,
+        GENERATION_TIMEOUT,
     )
     yield
     # アプリケーション終了時にクライアントを適切にクローズします。
@@ -236,6 +251,12 @@ def chunk_is_finish(obj: dict) -> bool:
         if ch.get("finish_reason"):
             return True
     return False
+
+
+def format_sse_comment(message: str) -> bytes:
+    """SSE コメント行を生成します。"""
+    sanitized = message.replace("\r", " ").replace("\n", " ")
+    return f": {sanitized}".encode("utf-8")
 
 
 def build_retry_payload(original_body: dict, retry_count: int) -> dict:
@@ -558,7 +579,137 @@ class RetryNeeded(Exception):
     pass
 
 
+class ChunkTimeoutError(Exception):
+    """チャンク途絶タイムアウトを示す例外です。"""
+    pass
+
+
+class ReasoningTimeoutError(Exception):
+    """Reasoning タイムアウトを示す例外です。"""
+    pass
+
+
+class GenerationTimeoutError(Exception):
+    """生成タイムアウトを示す例外です。"""
+    pass
+
+
 # ── リトライループ ────────────────────────────────────────────────────────────
+
+async def _anext_or_none(gen: AsyncGenerator) -> Any:
+    """StopAsyncIteration を None に変換します。"""
+    try:
+        return await gen.__anext__()
+    except StopAsyncIteration:
+        return None
+
+
+async def _iter_with_timeouts(
+    gen: AsyncGenerator,
+    chunk_timeout: float,
+    reasoning_timeout: float,
+    generation_timeout: float,
+    request_id: str = "-",
+) -> AsyncGenerator:
+    """タイムアウト監視付きストリームラッパーです。
+
+    以下の 3 種類のタイムアウトを監視します。
+
+    1. チャンク途絶タイムアウト: 意味のあるチャンクが chunk_timeout 秒以上届かない場合。
+       「意味のある」とは reasoning_content または content に非空文字列を含む場合です。
+       チャンクが全く届かない場合も同様にタイムアウトします。
+    2. Reasoning タイムアウト: Reasoning フェーズが reasoning_timeout 秒を超えた場合。
+    3. 生成タイムアウト: コンテンツ生成フェーズが generation_timeout 秒を超えた場合。
+
+    タイムアウト時は対応する例外を送出します。
+    timeout 値が 0 以下の場合は、そのタイムアウトは無効になります。
+    """
+    # 意味のあるチャンクが最後に届いた時刻（初期値は生成開始時刻）
+    last_meaningful_at = time.monotonic()
+    reasoning_started_at: float | None = None
+    generation_started_at: float | None = None
+    try:
+        while True:
+            now = time.monotonic()
+
+            # チャンク途絶タイムアウト: 次のチャンクを受信する（タイムアウト付き）
+            if chunk_timeout > 0:
+                try:
+                    item = await asyncio.wait_for(
+                        _anext_or_none(gen), timeout=chunk_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] chunk timeout: no chunk arrived for %.1fs",
+                        request_id,
+                        chunk_timeout,
+                    )
+                    raise ChunkTimeoutError()
+            else:
+                item = await _anext_or_none(gen)
+
+            if item is None:
+                # ストリームが正常終了しました。
+                return
+
+            ev, line, obj = item
+            now = time.monotonic()
+
+            if ev == "chunk":
+                chunk_obj = cast(dict, obj)
+                has_reasoning = chunk_has_reasoning(chunk_obj)
+                has_content = chunk_has_content(chunk_obj)
+                is_meaningful = has_reasoning or has_content
+
+                if has_reasoning and reasoning_started_at is None:
+                    reasoning_started_at = now
+                if has_content and generation_started_at is None:
+                    generation_started_at = now
+
+                if is_meaningful:
+                    last_meaningful_at = now
+                else:
+                    # 意味のないチャンクが届き続けている場合もチェック
+                    if chunk_timeout > 0 and (now - last_meaningful_at) > chunk_timeout:
+                        logger.warning(
+                            "[%s] chunk timeout: only empty chunks for %.1fs",
+                            request_id,
+                            now - last_meaningful_at,
+                        )
+                        raise ChunkTimeoutError()
+
+            # Reasoning タイムアウトチェック（Reasoning フェーズ中のみ）
+            if (
+                reasoning_timeout > 0
+                and reasoning_started_at is not None
+                and generation_started_at is None
+            ):
+                elapsed = now - reasoning_started_at
+                if elapsed > reasoning_timeout:
+                    logger.warning(
+                        "[%s] reasoning timeout: %.1fs elapsed (limit=%.1fs)",
+                        request_id,
+                        elapsed,
+                        reasoning_timeout,
+                    )
+                    raise ReasoningTimeoutError()
+
+            # 生成タイムアウトチェック（コンテンツ生成フェーズ中のみ）
+            if generation_timeout > 0 and generation_started_at is not None:
+                elapsed = now - generation_started_at
+                if elapsed > generation_timeout:
+                    logger.warning(
+                        "[%s] generation timeout: %.1fs elapsed (limit=%.1fs)",
+                        request_id,
+                        elapsed,
+                        generation_timeout,
+                    )
+                    raise GenerationTimeoutError()
+
+            yield ev, line, obj
+    finally:
+        await gen.aclose()
+
 
 async def run_with_retries(
     client: httpx.AsyncClient,
@@ -656,7 +807,13 @@ async def run_with_retries(
             return ("stream", result[1])
         else:
             # 非ストリーミングクライアントの場合: 全チャンクを収集してから組み立てます。
-            _ns_gen = stream_attempt(client, url, headers, body, params, request_id)
+            _ns_gen = _iter_with_timeouts(
+                stream_attempt(client, url, headers, body, params, request_id),
+                CHUNK_TIMEOUT,
+                REASONING_TIMEOUT,
+                GENERATION_TIMEOUT,
+                request_id,
+            )
             try:
                 async for ev, line, obj in _ns_gen:
                     if ev == "chunk":
@@ -675,12 +832,21 @@ async def run_with_retries(
                             retry_reason = "finish_before_reasoning"
                             break
                     elif ev == "done":
+                        if not saw_reasoning:
+                            cancel_retry = True
+                            retry_reason = "done_before_reasoning"
                         break
                     elif ev == "end":
+                        if not saw_reasoning:
+                            cancel_retry = True
+                            retry_reason = "end_before_reasoning"
                         break
                     else:
                         # raw 行は非ストリーミング組み立てには不要なため無視します。
                         pass
+            except (ChunkTimeoutError, ReasoningTimeoutError, GenerationTimeoutError) as e:
+                cancel_retry = True
+                retry_reason = type(e).__name__
             except UpstreamError as e:
                 return ("error", e.status, e.body, e.headers)
             except httpx.HTTPError as e:
@@ -747,7 +913,13 @@ async def _attempt_streaming_client(
     問題が検出された場合はストリームをキャンセルしてリトライを指示します。
     問題がなければバッファの内容を流し、残りのストリームを継続します。
     """
-    gen = stream_attempt(client, url, headers, body, params, request_id)
+    gen = _iter_with_timeouts(
+        stream_attempt(client, url, headers, body, params, request_id),
+        CHUNK_TIMEOUT,
+        REASONING_TIMEOUT,
+        GENERATION_TIMEOUT,
+        request_id,
+    )
     buffered_lines: list[bytes] = []
     saw_reasoning = False
     chunk_count = 0
@@ -763,12 +935,32 @@ async def _attempt_streaming_client(
                 buffered_lines.append(cast(bytes, line))
                 continue
             if ev == "done":
+                if not saw_reasoning:
+                    await gen.aclose()
+                    logger.info(
+                        "[%s] stream retry trigger reason=done_before_reasoning chunk=%s buffered_lines=%s duration_ms=%s",
+                        request_id,
+                        chunk_count,
+                        len(buffered_lines),
+                        _elapsed_ms(started_at),
+                    )
+                    return ("retry", "done_before_reasoning")
                 # ストリーム終了センチネルをバッファに記録して終了します。
                 buffered_lines.append(b"data: [DONE]")
                 ended_with_done = True
                 stream_ended = True
                 break
             if ev == "end":
+                if not saw_reasoning:
+                    await gen.aclose()
+                    logger.info(
+                        "[%s] stream retry trigger reason=end_before_reasoning chunk=%s buffered_lines=%s duration_ms=%s",
+                        request_id,
+                        chunk_count,
+                        len(buffered_lines),
+                        _elapsed_ms(started_at),
+                    )
+                    return ("retry", "end_before_reasoning")
                 stream_ended = True
                 break
             if ev == "chunk":
@@ -818,6 +1010,18 @@ async def _attempt_streaming_client(
                         _elapsed_ms(started_at),
                     )
                     break
+    except (ChunkTimeoutError, ReasoningTimeoutError, GenerationTimeoutError) as e:
+        await gen.aclose()
+        timeout_reason = type(e).__name__
+        logger.info(
+            "[%s] stream retry trigger reason=%s chunk=%s buffered_lines=%s duration_ms=%s",
+            request_id,
+            timeout_reason,
+            chunk_count,
+            len(buffered_lines),
+            _elapsed_ms(started_at),
+        )
+        return ("retry", timeout_reason)
     except UpstreamError as e:
         await gen.aclose()
         return ("error", e.status, e.body, e.headers)
@@ -888,6 +1092,18 @@ async def _attempt_streaming_client(
                 _elapsed_ms(forward_started_at),
             )
             raise
+        except (ChunkTimeoutError, ReasoningTimeoutError, GenerationTimeoutError) as e:
+            logger.warning(
+                "[%s] stream forward timed out reason=%s duration_ms=%s",
+                request_id,
+                type(e).__name__,
+                _elapsed_ms(forward_started_at),
+            )
+            yield format_sse_comment(
+                f"proxy stream cancelled after timeout: {type(e).__name__}"
+            ) + b"\n\n"
+            yield b"data: [DONE]\n\n"
+            return
         except Exception:
             logger.exception(
                 "[%s] stream forward failed duration_ms=%s",
@@ -1241,6 +1457,24 @@ if __name__ == "__main__":
         default=KEEP_REASONING_N,
         help=f"保持する reasoning_content / reasoning の最大件数（デフォルト: {KEEP_REASONING_N}、0 はすべて削除、負の値は無制限）",
     )
+    parser.add_argument(
+        "--chunk-timeout",
+        type=float,
+        default=CHUNK_TIMEOUT,
+        help=f"チャンク途絶タイムアウト（秒）。意味のあるチャンクがこの秒数届かない場合にリトライします（デフォルト: {CHUNK_TIMEOUT}、0 以下で無効）",
+    )
+    parser.add_argument(
+        "--reasoning-timeout",
+        type=float,
+        default=REASONING_TIMEOUT,
+        help=f"Reasoning タイムアウト（秒）。Reasoning フェーズがこの秒数を超えた場合にリトライします（デフォルト: {REASONING_TIMEOUT}、0 以下で無効）",
+    )
+    parser.add_argument(
+        "--generation-timeout",
+        type=float,
+        default=GENERATION_TIMEOUT,
+        help=f"生成タイムアウト（秒）。コンテンツ生成フェーズがこの秒数を超えた場合にリトライします（デフォルト: {GENERATION_TIMEOUT}、0 以下で無効）",
+    )
     args = parser.parse_args()
 
     # 引数でグローバル設定を上書きします。
@@ -1249,5 +1483,8 @@ if __name__ == "__main__":
     MAX_RETRIES = args.max_retries
     FORCE_MODEL = args.model
     KEEP_REASONING_N = args.keep_reasoning
+    CHUNK_TIMEOUT = args.chunk_timeout
+    REASONING_TIMEOUT = args.reasoning_timeout
+    GENERATION_TIMEOUT = args.generation_timeout
 
     uvicorn.run(app, host=args.host, port=args.port)

@@ -10,6 +10,7 @@ Manual retries can work around this, but the probability of skipping reasoning i
 This proxy automatically retries when no reasoning content is detected, ensuring that every response returned to the client is accompanied by reasoning.
 
 ~~This is a brute-force workaround. If there’s actually a setting that solves this, I’d appreciate it if someone could let me know...~~
+
 **Update:**
 
 By modifying the Jinja template to always start generation with `<|channel>thought\n* `, the improvement was dramatic — retries became almost unnecessary.  
@@ -40,6 +41,9 @@ This means stable Reasoning is now achievable without the proxy, but since the p
 6. If the retry count exceeds **100**, the proxy aborts and returns a `500` error to the client.
 7. Retry interval is 0 seconds (designed for local LLMs).
 8. Past `reasoning_content` or `reasoning` entries sent by the client (continuous reasoning support) are trimmed to keep only the latest **5** before forwarding to the upstream (configurable with `--keep-reasoning`).
+9. **Chunk interruption timeout**: If no meaningful chunk (non-empty `reasoning_content` or `content`) arrives for a set duration (default **10 seconds**) during reasoning or generation, the request is cancelled and retried. Also handles the case where only empty chunks keep flowing. Configurable with `--chunk-timeout` (disabled when ≤ 0).
+10. **Reasoning timeout**: If the reasoning phase exceeds a set duration (default **600 seconds**), the request is cancelled and retried. Configurable with `--reasoning-timeout` (disabled when ≤ 0).
+11. **Generation timeout**: If the content generation phase exceeds a set duration (default **600 seconds**), the request is cancelled and retried. Configurable with `--generation-timeout` (disabled when ≤ 0).
 
 ## Requirements
 
@@ -74,6 +78,9 @@ python proxy.py
 | `--port`      | `8000`                        | Port to bind                                             |
 | `--model`     | (none)                        | Override the client's model name with this value         |
 | `--keep-reasoning` | `5`                      | Maximum number of `reasoning_content` / `reasoning` entries to keep (0 removes all, negative keeps all) |
+| `--chunk-timeout` | `10`                      | Chunk interruption timeout in seconds. Retries if no meaningful chunk arrives within this duration (disabled when ≤ 0) |
+| `--reasoning-timeout` | `600`               | Reasoning phase timeout in seconds. Retries if reasoning exceeds this duration (disabled when ≤ 0) |
+| `--generation-timeout` | `600`              | Generation phase timeout in seconds. Retries if content generation exceeds this duration (disabled when ≤ 0) |
 
 ```bash
 python proxy.py --upstream http://localhost:11434/ --port 8000
