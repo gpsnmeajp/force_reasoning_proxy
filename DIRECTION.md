@@ -44,3 +44,36 @@ data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"\""}}],"cr
 data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"response"}}],"created":1779518360,"id":"chatcmpl-c2PLrEaGTr4itu907yXwzGqtp9Hl787w","model":"unsloth/gemma-4-26B-A4B-it-GGUF:Q6_K","system_fingerprint":"b9254-e94722822","object":"chat.completion.chunk"}
 
 ```
+
+---
+
+# 機能追加
+クライアントからは、過去のすべてのreasoning_contentが送られてきます。(連続的推論サポート)
+これを、最新N件を残してそれより過去を削除するようにしてください。(既定でN=5, 引数で設定可能)
+
+```
+    {
+      "role": "user",
+      "content": "xxxxxxxxxxxxxx"
+    },
+    {
+      "role": "assistant",
+      "content": "xxxxxxxxxxxxxxx",
+      "reasoning_content": "xxxxxxxxxxxxxxxxxxxxxx",
+      "reasoningTimeMs": 70222
+    },
+    {
+      "role": "user",
+      "content": "xxxxxxxxxxxxxxxxxxx"
+    },
+```
+
+# チャンク途絶タイムアウト
+推論の途中(Reasoningや最終生成中)に、生成が中断(スタック)することがあります。
+途中で突如追加のチャンクが来なくなり(あるいは空のチャンクだけが来て)、N秒(既定でN=10, 引数で設定可能)経過した場合、生成を強制的にキャンセルしてください。
+
+チャンクが再開した場合、経過時間はリセットします。
+
+# Reasoningタイムアウトと、生成タイムアウト
+Reasoningが長時間続いたり、生成が長時間続く場合があります。それぞれに対して秒数でタイムアウトを設定できるようにしてください。
+タイムアウトした場合、生成を強制的にキャンセルしてください。(既定で600秒)

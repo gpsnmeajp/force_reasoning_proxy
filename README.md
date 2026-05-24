@@ -39,6 +39,7 @@ This means stable Reasoning is now achievable without the proxy, but since the p
 5. If the retry count exceeds **5**, a `<|think|>` token is appended to the end of the last user message on retry (one token added per 5 retries).
 6. If the retry count exceeds **100**, the proxy aborts and returns a `500` error to the client.
 7. Retry interval is 0 seconds (designed for local LLMs).
+8. Past `reasoning_content` or `reasoning` entries sent by the client (continuous reasoning support) are trimmed to keep only the latest **5** before forwarding to the upstream (configurable with `--keep-reasoning`).
 
 ## Requirements
 
@@ -72,6 +73,7 @@ python proxy.py
 | `--host`      | `0.0.0.0`                     | Host to bind                                             |
 | `--port`      | `8000`                        | Port to bind                                             |
 | `--model`     | (none)                        | Override the client's model name with this value         |
+| `--keep-reasoning` | `5`                      | Maximum number of `reasoning_content` / `reasoning` entries to keep (0 removes all, negative keeps all) |
 
 ```bash
 python proxy.py --upstream http://localhost:11434/ --port 8000

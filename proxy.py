@@ -41,6 +41,11 @@ THINK_TOKEN = "<|think|>"
 # None のときは上書きしません。
 FORCE_MODEL: str | None = None
 
+# 連続的推論サポート: クライアントから送られてくる assistant メッセージの
+# reasoning_content / reasoning を最新 N 件のみ保持し、古いものは削除します。
+# 0 はすべて削除、負の値は無制限に保持します。
+KEEP_REASONING_N: int = 5
+
 
 # ── アプリケーションライフサイクル ───────────────────────────────────────────
 
@@ -50,12 +55,13 @@ async def lifespan(app: FastAPI):
     # アプリケーション全体で再利用する非同期 HTTP クライアントを初期化します。
     app.state.http_client = httpx.AsyncClient()
     logger.info(
-        "proxy startup upstream=%s buffer_chunks=%s max_retries=%s think_threshold=%s force_model=%s",
+        "proxy startup upstream=%s buffer_chunks=%s max_retries=%s think_threshold=%s force_model=%s keep_reasoning_n=%s",
         UPSTREAM_BASE_URL,
         BUFFER_CHUNKS,
         MAX_RETRIES,
         THINK_THRESHOLD,
         FORCE_MODEL or "-",
+        KEEP_REASONING_N,
     )
     yield
     # アプリケーション終了時にクライアントを適切にクローズします。
@@ -100,6 +106,42 @@ def _summarize_message_roles(messages: Any) -> str:
         role_key = role if isinstance(role, str) and role else "?"
         counts[role_key] = counts.get(role_key, 0) + 1
     return ",".join(f"{role}:{counts[role]}" for role in sorted(counts))
+
+
+def _trim_old_reasoning(messages: list, keep_n: int) -> list:
+    """メッセージリスト内の古い reasoning_content / reasoning を削除します。
+
+    assistant メッセージの reasoning_content / reasoning を最新 keep_n 件のみ残します。
+    keep_n が 0 の場合はすべて削除します。
+    keep_n が負の場合は何も削除しません。
+    """
+    if keep_n < 0:
+        return messages
+
+    reasoning_keys = {"reasoning_content", "reasoning"}
+
+    # reasoning_content / reasoning を持つ assistant メッセージのインデックスを収集します。
+    reasoning_indices = [
+        i for i, m in enumerate(messages)
+        if isinstance(m, dict)
+        and m.get("role") == "assistant"
+        and any(key in m for key in reasoning_keys)
+    ]
+
+    if len(reasoning_indices) <= keep_n:
+        # 削除対象がないのでそのまま返します。
+        return messages
+
+    # 古い方から削除対象のインデックスセットを決定します。
+    remove_set = set(reasoning_indices[: len(reasoning_indices) - keep_n])
+
+    result = []
+    for i, msg in enumerate(messages):
+        if i in remove_set:
+            # 推論フィールドのみ除いた新しい dict を生成します。
+            msg = {k: v for k, v in msg.items() if k not in reasoning_keys}
+        result.append(msg)
+    return result
 
 
 def _summarize_chat_body(body: dict) -> str:
@@ -940,6 +982,10 @@ async def chat_completions(request: Request):
     if FORCE_MODEL is not None:
         body["model"] = FORCE_MODEL
 
+    # 古い reasoning_content / reasoning を削除します（連続的推論サポート）。
+    if KEEP_REASONING_N >= 0 and isinstance(body.get("messages"), list):
+        body["messages"] = _trim_old_reasoning(body["messages"], KEEP_REASONING_N)
+
     # ホップバイホップヘッダーを除去してからアップストリームへ転送するヘッダーを構築します。
     fwd_headers = _filter_hop_headers(dict(request.headers.items()))
     fwd_headers["accept"] = "text/event-stream"
@@ -1189,6 +1235,12 @@ if __name__ == "__main__":
         default=None,
         help="クライアントのモデル名を常にこの値で上書きします（省略時は上書きしない）",
     )
+    parser.add_argument(
+        "--keep-reasoning",
+        type=int,
+        default=KEEP_REASONING_N,
+        help=f"保持する reasoning_content / reasoning の最大件数（デフォルト: {KEEP_REASONING_N}、0 はすべて削除、負の値は無制限）",
+    )
     args = parser.parse_args()
 
     # 引数でグローバル設定を上書きします。
@@ -1196,5 +1248,6 @@ if __name__ == "__main__":
     BUFFER_CHUNKS = args.buffer_chunks
     MAX_RETRIES = args.max_retries
     FORCE_MODEL = args.model
+    KEEP_REASONING_N = args.keep_reasoning
 
     uvicorn.run(app, host=args.host, port=args.port)
