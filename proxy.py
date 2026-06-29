@@ -58,6 +58,9 @@ REASONING_TIMEOUT: float = 600.0
 # 生成をキャンセルしてリトライします。0 以下で無効。
 GENERATION_TIMEOUT: float = 600.0
 
+# エリプシス除去フラグ。True の場合、AIの応答からエリプシス「…」を除去します。
+REMOVE_ELLIPSIS: bool = False
+
 
 # ── アプリケーションライフサイクル ───────────────────────────────────────────
 
@@ -67,7 +70,7 @@ async def lifespan(app: FastAPI):
     # アプリケーション全体で再利用する非同期 HTTP クライアントを初期化します。
     app.state.http_client = httpx.AsyncClient()
     logger.info(
-        "proxy startup upstream=%s buffer_chunks=%s max_retries=%s think_threshold=%s force_model=%s keep_reasoning_n=%s chunk_timeout=%s reasoning_timeout=%s generation_timeout=%s",
+        "proxy startup upstream=%s buffer_chunks=%s max_retries=%s think_threshold=%s force_model=%s keep_reasoning_n=%s chunk_timeout=%s reasoning_timeout=%s generation_timeout=%s remove_ellipsis=%s",
         UPSTREAM_BASE_URL,
         BUFFER_CHUNKS,
         MAX_RETRIES,
@@ -77,6 +80,7 @@ async def lifespan(app: FastAPI):
         CHUNK_TIMEOUT,
         REASONING_TIMEOUT,
         GENERATION_TIMEOUT,
+        REMOVE_ELLIPSIS,
     )
     yield
     # アプリケーション終了時にクライアントを適切にクローズします。
@@ -206,6 +210,41 @@ def parse_sse_line(line: bytes) -> bytes | None:
         return None
     # 先頭の 'data:' 部分を除去し、余分な空白を取り除いて返します。
     return line[5:].lstrip()
+
+
+def remove_ellipsis_from_chunk(chunk_obj: dict) -> dict:
+    """チャンクオブジェクトからエリプシス「…」を除去します。
+
+    reasoning_content、reasoning、content フィールドに含まれる「…」を除去します。
+    元のオブジェクトは変更せず、新しいオブジェクトを返します。
+    """
+    if not REMOVE_ELLIPSIS:
+        return chunk_obj
+    
+    result = copy.deepcopy(chunk_obj)
+    choices = result.get("choices")
+    if not isinstance(choices, list):
+        return result
+    
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        
+        # ストリーミングの場合は delta から除去
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            for key in ["reasoning_content", "reasoning", "content"]:
+                if key in delta and isinstance(delta[key], str):
+                    delta[key] = delta[key].replace("…", "")
+        
+        # 非ストリーミングの場合は message から除去
+        message = choice.get("message")
+        if isinstance(message, dict):
+            for key in ["reasoning_content", "reasoning", "content"]:
+                if key in message and isinstance(message[key], str):
+                    message[key] = message[key].replace("…", "")
+    
+    return result
 
 
 # ── チャンク検査ユーティリティ ───────────────────────────────────────────────
@@ -433,7 +472,8 @@ def assemble_non_streaming_response(
     if "model" not in result and model_hint is not None:
         result["model"] = model_hint
     result["choices"] = [choices[i] for i in sorted(choices.keys())]
-    return result
+    # エリプシスを除去してから返します。
+    return remove_ellipsis_from_chunk(result)
 
 
 # ── アップストリーム通信 ──────────────────────────────────────────────────────
@@ -1002,7 +1042,10 @@ async def _attempt_streaming_client(
                         _elapsed_ms(started_at),
                     )
                     return ("retry", "finish_before_reasoning")
-                buffered_lines.append(cast(bytes, line))
+                # エリプシスを除去してからバッファに追加します。
+                processed_obj = remove_ellipsis_from_chunk(chunk_obj)
+                processed_line = b"data: " + json.dumps(processed_obj, ensure_ascii=False).encode("utf-8")
+                buffered_lines.append(processed_line)
                 # 最初の BUFFER_CHUNKS チャンクは必ずバッファし、その後も推論確認まではコミットしません。
                 if chunk_count > BUFFER_CHUNKS and saw_reasoning:
                     # 推論が確認されたのでコミットします。
@@ -1071,7 +1114,12 @@ async def _attempt_streaming_client(
                 yield ln + b"\n\n"
             # 残りのストリームをそのまま転送します。
             async for ev, line, obj in gen:
-                if ev == "chunk" or ev == "raw":
+                if ev == "chunk":
+                    # エリプシスを除去してから転送します。
+                    processed_obj = remove_ellipsis_from_chunk(cast(dict, obj))
+                    processed_line = b"data: " + json.dumps(processed_obj, ensure_ascii=False).encode("utf-8")
+                    yield processed_line + b"\n\n"
+                elif ev == "raw":
                     yield cast(bytes, line) + b"\n\n"
                 elif ev == "done":
                     logger.info(
@@ -1479,6 +1527,11 @@ if __name__ == "__main__":
         default=GENERATION_TIMEOUT,
         help=f"生成タイムアウト（秒）。コンテンツ生成フェーズがこの秒数を超えた場合にリトライします（デフォルト: {GENERATION_TIMEOUT}、0 以下で無効）",
     )
+    parser.add_argument(
+        "--remove-ellipsis",
+        action="store_true",
+        help="AIの応答からエリプシス「…」を除去します（デフォルト: 無効）",
+    )
     args = parser.parse_args()
 
     # 引数でグローバル設定を上書きします。
@@ -1490,5 +1543,6 @@ if __name__ == "__main__":
     CHUNK_TIMEOUT = args.chunk_timeout
     REASONING_TIMEOUT = args.reasoning_timeout
     GENERATION_TIMEOUT = args.generation_timeout
+    REMOVE_ELLIPSIS = args.remove_ellipsis
 
     uvicorn.run(app, host=args.host, port=args.port)
