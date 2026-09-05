@@ -193,8 +193,16 @@ def _summarize_chat_body(body: dict) -> str:
     )
 
 
-def _with_request_id_header(response: Response, request_id: str) -> Response:
-    """レスポンスに request_id を付与して返します。"""
+def _with_request_id_header(
+    response: Response, request_id: str, headers: httpx.Headers | dict | None = None
+) -> Response:
+    """upstream の重複ヘッダーを継承し、proxy の request_id を付与します。"""
+    if headers is not None:
+        upstream = httpx.Headers(headers)
+        names = {name.lower() for name, _ in upstream.raw}
+        response.raw_headers[:] = [
+            (name, value) for name, value in response.raw_headers if name not in names
+        ] + [(name.lower(), value) for name, value in upstream.raw]
     response.headers["X-Proxy-Request-Id"] = request_id
     return response
 
@@ -485,6 +493,7 @@ async def stream_attempt(
     body: dict,
     params: tuple[tuple[str, str], ...] | None = None,
     request_id: str = "-",
+    response_headers: httpx.Headers | None = None,
 ) -> AsyncGenerator[
     tuple[Literal["chunk"], bytes, dict]
     | tuple[Literal["raw"], bytes, None]
@@ -532,11 +541,13 @@ async def stream_attempt(
                 raise UpstreamError(
                     resp.status_code,
                     body_bytes,
-                    _filter_response_headers(dict(resp.headers.items())),
+                    _filter_response_headers(resp.headers),
                 )
+            if response_headers is not None:
+                response_headers.update(_filter_response_headers(resp.headers, transformed=True))
             buf = b""
             # レスポンスボディをバイト単位で受信し、改行ごとに処理します。
-            async for raw in resp.aiter_raw():
+            async for raw in resp.aiter_bytes():
                 buf += raw
                 while True:
                     nl = buf.find(b"\n")
@@ -606,7 +617,7 @@ async def stream_attempt(
 class UpstreamError(Exception):
     """アップストリームサーバーが 4xx/5xx エラーを返した場合に送出される例外です。"""
 
-    def __init__(self, status: int, body: bytes, headers: dict[str, str]):
+    def __init__(self, status: int, body: bytes, headers: httpx.Headers | dict[str, str]):
         self.status = status
         self.body = body
         self.headers = headers
@@ -764,15 +775,15 @@ async def run_with_retries(
     params: tuple[tuple[str, str], ...] | None = None,
     request_id: str = "-",
 ) -> (
-    tuple[Literal["error"], int, bytes, dict[str, str]]
-    | tuple[Literal["stream"], AsyncGenerator[bytes, None]]
-    | tuple[Literal["full"], dict]
+    tuple[Literal["error"], int, bytes, httpx.Headers | dict[str, str]]
+    | tuple[Literal["stream"], AsyncGenerator[bytes, None], httpx.Headers]
+    | tuple[Literal["full"], dict, httpx.Headers]
 ):
     """推論コンテンツが得られるまでリトライループを駆動します。
 
     戻り値:
-      ("stream", async_generator) — クライアントがストリーミングを要求した場合
-      ("full",   dict)            — クライアントが非ストリーミングを要求した場合
+      ("stream", async_generator, headers) — クライアントがストリーミングを要求した場合
+      ("full",   dict, headers)            — クライアントが非ストリーミングを要求した場合
             ("error",  status, body, headers) — upstream または proxy 側のエラーが発生した場合
     """
     retry_count = 0
@@ -848,11 +859,12 @@ async def run_with_retries(
                 retry_count + 1,
                 _elapsed_ms(started_at),
             )
-            return ("stream", result[1])
+            return ("stream", result[1], result[2])
         else:
             # 非ストリーミングクライアントの場合: 全チャンクを収集してから組み立てます。
+            response_headers = httpx.Headers()
             _ns_gen = _iter_with_timeouts(
-                stream_attempt(client, url, headers, body, params, request_id),
+                stream_attempt(client, url, headers, body, params, request_id, response_headers),
                 CHUNK_TIMEOUT,
                 REASONING_TIMEOUT,
                 GENERATION_TIMEOUT,
@@ -929,7 +941,7 @@ async def run_with_retries(
                 saw_reasoning,
                 _elapsed_ms(started_at),
             )
-            return ("full", assembled)
+            return ("full", assembled, response_headers)
 
 
 # ── ストリーミングクライアント向け処理 ──────────────────────────────────────
@@ -943,22 +955,23 @@ async def _attempt_streaming_client(
     request_id: str = "-",
 ) -> (
     tuple[Literal["retry"], str]
-    | tuple[Literal["error"], int, bytes, dict[str, str]]
-    | tuple[Literal["commit"], AsyncGenerator[bytes, None]]
+    | tuple[Literal["error"], int, bytes, httpx.Headers | dict[str, str]]
+    | tuple[Literal["commit"], AsyncGenerator[bytes, None], httpx.Headers]
 ):
     """ストリーミングクライアント向けの 1 回の接続試行を行います。
 
     戻り値:
       ("retry",)                 — リトライが必要
     ("error",  status, body, headers) — エラー
-      ("commit", async_gen)      — コミット完了。gen が SSE バイトを生成します
+      ("commit", async_gen, headers)      — コミット完了。gen が SSE バイトを生成します
 
     BUFFER_CHUNKS 分のチャンクを先読みし、推論の有無を確認します。
     問題が検出された場合はストリームをキャンセルしてリトライを指示します。
     問題がなければバッファの内容を流し、残りのストリームを継続します。
     """
+    response_headers = httpx.Headers()
     gen = _iter_with_timeouts(
-        stream_attempt(client, url, headers, body, params, request_id),
+        stream_attempt(client, url, headers, body, params, request_id, response_headers),
         CHUNK_TIMEOUT,
         REASONING_TIMEOUT,
         GENERATION_TIMEOUT,
@@ -1103,7 +1116,8 @@ async def _attempt_streaming_client(
             # [DONE] が含まれていない場合は補完します。
             if not ended_with_done:
                 yield b"data: [DONE]\n\n"
-        return ("commit", short_gen())
+        await gen.aclose()
+        return ("commit", short_gen(), response_headers)
 
     # ストリームの途中でコミット: バッファを送信後、残りのストリームを転送します。
     async def forward_gen():
@@ -1167,7 +1181,7 @@ async def _attempt_streaming_client(
             # 確実にジェネレータをクローズしてリソースを解放します。
             await gen.aclose()
 
-    return ("commit", forward_gen())
+    return ("commit", forward_gen(), response_headers)
 
 
 # ── ヘッダーフィルタリング ────────────────────────────────────────────────────
@@ -1183,22 +1197,40 @@ def _filter_hop_headers(headers: dict) -> dict:
         "host",
         "content-length",
         "connection",
+        "proxy-connection",
         "keep-alive",
         "proxy-authenticate",
         "proxy-authorization",
         "te",
+        "trailer",
         "trailers",
         "transfer-encoding",
         "upgrade",
         "accept-encoding",
     }
+    for key, value in headers.items():
+        if key.lower() == "connection":
+            hop.update(token.strip().lower() for token in value.split(","))
     return {k: v for k, v in headers.items() if k.lower() not in hop}
 
 
-def _filter_response_headers(headers: dict) -> dict:
-    """プロキシがそのまま返すのに不適切なレスポンスヘッダーを除去します。"""
-    excluded = {"content-encoding", "transfer-encoding", "content-length", "connection"}
-    return {k: v for k, v in headers.items() if k.lower() not in excluded}
+def _filter_response_headers(
+    headers: httpx.Headers, *, transformed: bool = False
+) -> httpx.Headers:
+    """重複ヘッダーを保持し、接続・本文変換により無効になるものだけ除去します。"""
+    excluded = {
+        "content-encoding", "transfer-encoding", "content-length", "connection",
+        "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
+        "trailer", "trailers", "upgrade", "proxy-connection",
+    }
+    excluded.update(token.strip().lower() for token in headers.get("connection", "").split(","))
+    if transformed:
+        excluded.update({"etag", "last-modified", "content-md5", "digest",
+                         "content-digest", "repr-digest", "content-range", "accept-ranges"})
+    return httpx.Headers([
+        (name, value) for name, value in headers.raw
+        if name.decode("ascii").lower() not in excluded
+    ])
 
 
 def _build_upstream_url(full_path: str) -> str:
@@ -1298,8 +1330,9 @@ async def chat_completions(request: Request):
             _elapsed_ms(request_started_at),
         )
         return _with_request_id_header(
-            Response(content=body_bytes, status_code=status, headers=headers),
+            Response(content=body_bytes, status_code=status),
             request_id,
+            headers,
         )
 
     # 非ストリーミング: 組み立て済みのレスポンス JSON をそのまま返します。
@@ -1311,7 +1344,9 @@ async def chat_completions(request: Request):
             len(outcome[1].get("choices") or []),
             _elapsed_ms(request_started_at),
         )
-        return _with_request_id_header(JSONResponse(outcome[1]), request_id)
+        headers = outcome[2]
+        headers.pop("content-type", None)  # SSE から JSON に変換した本文に合わせます。
+        return _with_request_id_header(JSONResponse(outcome[1]), request_id, headers)
 
     # ストリーミング: SSE バイトをクライアントへ逐次送信します。
     if outcome[0] == "stream":
@@ -1361,11 +1396,11 @@ async def chat_completions(request: Request):
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",   # キャッシュを無効化します。
-                    "Connection": "keep-alive",     # 接続を維持します。
                     "X-Accel-Buffering": "no",      # nginx のバッファリングを無効化します。
                 },
             ),
             request_id,
+            outcome[2],
         )
 
     # 想定外の結果タイプが返された場合のフォールバックです。
@@ -1384,19 +1419,6 @@ async def chat_completions(request: Request):
 async def passthrough(full_path: str, request: Request):
     request_id = _make_request_id(request)
     request_started_at = time.perf_counter()
-
-    # Don't intercept the chat completions route (handled above)
-    if full_path in ("v1/chat/completions", "chat/completions"):
-        # Shouldn't reach here due to specific routes above, but safety
-        logger.error(
-            "[%s] passthrough hit guarded chat route path=%s",
-            request_id,
-            request.url.path,
-        )
-        return _with_request_id_header(
-            JSONResponse({"error": {"message": "internal routing error"}}, status_code=500),
-            request_id,
-        )
 
     url = _build_upstream_url(full_path)
 
@@ -1438,7 +1460,7 @@ async def passthrough(full_path: str, request: Request):
             request_id,
         )
 
-    resp_headers = _filter_response_headers(dict(resp.headers.items()))
+    resp_headers = _filter_response_headers(resp.headers)
     log = logger.warning if resp.status_code >= 400 else logger.info
     log(
         "[%s] passthrough response method=%s path=%s upstream_status=%s upstream_url=%s content_type=%s duration_ms=%s body=%s",
@@ -1456,10 +1478,9 @@ async def passthrough(full_path: str, request: Request):
         Response(
             content=resp.content,
             status_code=resp.status_code,
-            headers=resp_headers,
-            media_type=resp.headers.get("content-type"),
         ),
         request_id,
+        resp_headers,
     )
 
 

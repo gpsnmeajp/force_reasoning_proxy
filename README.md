@@ -31,6 +31,10 @@ This means stable Reasoning is now achievable without the proxy, but since the p
 {%- endif -%}
 ```
 
+## Chat Template License
+
+The chat templates in this repository are derived from Google Gemma4 and retain its Apache License 2.0.
+
 ## How It Works
 
 1. Forwards requests from the client to the upstream LLM server.

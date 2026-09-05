@@ -32,6 +32,10 @@ jinja templateを加工し、常に `<|channel>thought\n* ` から始めるよ�
 ```
 
 
+## Chattemplateのライセンス
+
+このリポジトリのChattemplateはGoogle Gemma4に由来し、そのApache 2.0ライセンスを引き継ぎます。
+
 ## 動作概要
 
 1. クライアントからのリクエストをアップストリーム LLM サーバーへ転送します。
